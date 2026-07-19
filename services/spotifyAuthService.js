@@ -4,6 +4,14 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 
 let _spDcCache = null;
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+export function updateSpDc(value) {
+  _spDcCache = value;
+  cachedToken = null;
+  tokenExpiresAt = 0;
+}
 
 function getSpDc() {
   if (_spDcCache) return _spDcCache;
@@ -168,6 +176,10 @@ function useFallbackSecret() {
 }
 
 export async function getToken(reason = "init", productType = "mobile-web-player") {
+  if (cachedToken && Date.now() < tokenExpiresAt) {
+    return cachedToken;
+  }
+
   // Ensure we have a TOTP instance
   if (!currentTotp) {
     await initializeTOTPSecrets();
@@ -187,7 +199,19 @@ export async function getToken(reason = "init", productType = "mobile-web-player
     },
   });
 
-  return response.data?.accessToken;
+  const token = response.data?.accessToken;
+  if (token) {
+    cachedToken = token;
+    const expiresTimestamp = response.data?.accessTokenExpirationTimestampMs;
+    if (expiresTimestamp && !isNaN(expiresTimestamp)) {
+      // Refresh 5 minutes before actual expiry
+      tokenExpiresAt = Number(expiresTimestamp) - 5 * 60 * 1000;
+    } else {
+      tokenExpiresAt = Date.now() + 50 * 60 * 1000;
+    }
+  }
+
+  return token;
 }
 
 async function generateAuthPayload(reason, productType) {

@@ -1,9 +1,31 @@
 import puppeteer from 'puppeteer-core';
 import fs from 'fs';
 import path from 'path';
+import { updateSpDc } from './spotifyAuthService.js';
 
 let cachedCreds = null;
 let credsExpiresAt = 0;
+let browser = null;
+let page = null;
+let pendingResolvers = [];
+let activeRefreshPromise = null;
+let pageNavigationPromise = null;
+
+const runWithPageLock = async (fn) => {
+  while (pageNavigationPromise) {
+    try {
+      await pageNavigationPromise;
+    } catch (e) {}
+  }
+  pageNavigationPromise = (async () => {
+    try {
+      return await fn();
+    } finally {
+      pageNavigationPromise = null;
+    }
+  })();
+  return pageNavigationPromise;
+};
 
 const parseNetscapeCookies = (text) => {
   const cookies = [];
@@ -37,9 +59,64 @@ const getExecutablePath = () => {
   return null;
 };
 
-export const getBrowserCredentials = async () => {
-  if (cachedCreds && Date.now() < credsExpiresAt) {
-    return cachedCreds;
+// Update cookies from browser context to sp_dc
+const syncCookies = async () => {
+  if (!page) return;
+  try {
+    const pageCookies = await page.cookies();
+    const spDcCookie = pageCookies.find(c => c.name === 'sp_dc');
+    if (spDcCookie) {
+      updateSpDc(spDcCookie.value);
+      console.log('Synced sp_dc cookie from persistent browser:', spDcCookie.value);
+    }
+  } catch (error) {
+    console.error('Failed to sync cookies from browser:', error.message);
+  }
+};
+
+// Plays a song briefly to trigger cookie/token updates
+const playSongToRefreshSession = () => runWithPageLock(async () => {
+  if (!page) return;
+  try {
+    console.log('Navigating to a Spotify track to trigger playback session refresh...');
+    // Navigate to a popular stable track
+    await page.goto('https://open.spotify.com/track/4PTG3Z6ehGkBF3zI7Ywt8q', { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Wait for the main play button to be rendered
+    const playButtonSelector = 'button[data-testid="play-button"], button[aria-label="Play"]';
+    await page.waitForSelector(playButtonSelector, { timeout: 10000 });
+    
+    // Click play
+    await page.click(playButtonSelector);
+    console.log('Playback command sent. Waiting 6 seconds to let Spotify update session tokens...');
+    await new Promise(resolve => setTimeout(resolve, 6000));
+    
+    // Pause playback to prevent running up data/audio streams indefinitely
+    const pauseButtonSelector = 'button[data-testid="control-button-playpause"], button[aria-label="Pause"]';
+    try {
+      await page.waitForSelector(pauseButtonSelector, { timeout: 2000 });
+      await page.click(pauseButtonSelector);
+      console.log('Playback paused successfully.');
+    } catch (e) {
+      console.log('Could not find pause button (or already paused), continuing...');
+    }
+    
+    // Navigate back to search to be ready for search header intercepts
+    await page.goto('https://open.spotify.com/search', { waitUntil: 'networkidle2', timeout: 30000 });
+  } catch (error) {
+    console.error('Failed to trigger song playback refresh:', error.message);
+    // Fallback: make sure we are back on search page
+    try {
+      await page.goto('https://open.spotify.com/search', { waitUntil: 'networkidle2', timeout: 20000 });
+    } catch (e) {}
+  }
+});
+
+export const initPersistentBrowser = async () => {
+  if (browser) {
+    try {
+      await browser.close();
+    } catch (e) {}
   }
 
   const cookiePath = path.resolve('cookies.txt');
@@ -52,51 +129,94 @@ export const getBrowserCredentials = async () => {
     throw new Error('Chrome/Chromium not found. Install Chrome or set PUPPETEER_EXECUTABLE_PATH.');
   }
 
-  console.log('Launching headless browser to retrieve Spotify credentials...');
+  console.log('Starting persistent headless browser...');
   const cookieText = fs.readFileSync(cookiePath, 'utf8');
   const cookies = parseNetscapeCookies(cookieText);
 
-  const browser = await puppeteer.launch({
+  browser = await puppeteer.launch({
     executablePath,
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
   });
 
-  try {
-    const page = await browser.newPage();
-    await page.setCookie(...cookies);
+  page = await browser.newPage();
+  await page.setCookie(...cookies);
 
-    let authorization = null;
-    let clientToken = null;
+  page.on('request', async (request) => {
+    const headers = request.headers();
+    if (headers['authorization'] && headers['authorization'].startsWith('Bearer ') && headers['client-token']) {
+      const authorization = headers['authorization'].split(' ')[1];
+      const clientToken = headers['client-token'];
+      
+      cachedCreds = { authorization, clientToken };
+      // Cache for 50 minutes
+      credsExpiresAt = Date.now() + 50 * 60 * 1000;
+      
+      const resolvers = [...pendingResolvers];
+      pendingResolvers = [];
+      for (const resolver of resolvers) {
+        resolver(cachedCreds);
+      }
+    }
+  });
 
+  // Periodically sync sp_dc cookie and reload page to keep session alive
+  page.on('load', syncCookies);
+
+  console.log('Navigating persistent browser to Spotify...');
+  await page.goto('https://open.spotify.com/search', { waitUntil: 'networkidle2', timeout: 60000 });
+  await syncCookies();
+
+  // Play a song on initialization to ensure cookies get updated immediately
+  await playSongToRefreshSession();
+
+  // Refresh every 15 minutes by playing a song and syncing cookies
+  setInterval(async () => {
+    try {
+      console.log('Triggering periodic playback session refresh...');
+      await playSongToRefreshSession();
+      await syncCookies();
+    } catch (error) {
+      console.error('Error refreshing persistent browser page:', error.message);
+    }
+  }, 15 * 60 * 1000);
+};
+
+export const getBrowserCredentials = async () => {
+  if (!browser || !page) {
+    await initPersistentBrowser();
+  }
+
+  if (cachedCreds && Date.now() < credsExpiresAt) {
+    return cachedCreds;
+  }
+
+  if (activeRefreshPromise) {
+    return activeRefreshPromise;
+  }
+
+  activeRefreshPromise = (async () => {
+    console.log('Credentials expired or missing, triggering song play session to refresh...');
     const credsPromise = new Promise((resolve) => {
-      page.on('request', request => {
-        const headers = request.headers();
-        if (headers['authorization'] && headers['authorization'].startsWith('Bearer ') && headers['client-token']) {
-          if (!authorization) {
-            authorization = headers['authorization'].split(' ')[1];
-            clientToken = headers['client-token'];
-            resolve({ authorization, clientToken });
-          }
-        }
-      });
+      pendingResolvers.push(resolve);
     });
 
-    await page.goto('https://open.spotify.com/search', { waitUntil: 'networkidle2', timeout: 30000 });
+    try {
+      await playSongToRefreshSession();
+      const creds = await Promise.race([
+        credsPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Credential detection timed out')), 25000))
+      ]);
+      return creds;
+    } catch (error) {
+      throw error;
+    } finally {
+      activeRefreshPromise = null;
+      pendingResolvers = [];
+    }
+  })();
 
-    const creds = await Promise.race([
-      credsPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Credential detection timed out')), 15000))
-    ]);
-
-    // Cache for 50 minutes
-    cachedCreds = creds;
-    credsExpiresAt = Date.now() + 50 * 60 * 1000;
-    console.log('Credentials retrieved and cached successfully.');
-    return creds;
-  } finally {
-    await browser.close();
-  }
+  return activeRefreshPromise;
 };
 
 // Search using Spotify's internal GraphQL v2 endpoint
