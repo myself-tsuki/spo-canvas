@@ -6,7 +6,7 @@ on:
       target_db_name:
         description: 'Target Database Name'
         required: false
-        default: 'sys'
+        default: 'test'
       source_db_name:
         description: 'Source Database Name'
         required: false
@@ -42,5 +42,5 @@ jobs:
           TARGET_DB_PORT: ${{ secrets.TARGET_DB_PORT || '4000' }}
           TARGET_DB_USER: ${{ secrets.TARGET_DB_USER || 'NJiLRqKxh1QG3am.root' }}
           TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD || 'H6YEFIEODY97QvHQ' }}
-          TARGET_DB_NAME: ${{ github.event.inputs.target_db_name || secrets.TARGET_DB_NAME || 'sys' }}
+          TARGET_DB_NAME: ${{ github.event.inputs.target_db_name || secrets.TARGET_DB_NAME || 'test' }}
         run: node migrate/migrate.js
