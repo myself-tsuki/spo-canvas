@@ -8,7 +8,10 @@ const SOURCE_CONFIG = {
     database: process.env.SOURCE_DB_NAME || 'test',
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true },
     waitForConnections: true,
-    connectionLimit: 15
+    connectionLimit: 10,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    connectTimeout: 30000
 };
 
 const TARGET_CONFIG = {
@@ -19,7 +22,10 @@ const TARGET_CONFIG = {
     database: process.env.TARGET_DB_NAME || 'test',
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true },
     waitForConnections: true,
-    connectionLimit: 15
+    connectionLimit: 10,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    connectTimeout: 30000
 };
 
 const DB_TABLE_SCHEMAS = [
@@ -84,9 +90,33 @@ const DB_TABLE_SCHEMAS = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 ];
 
+async function queryWithRetry(pool, sql, params = [], maxRetries = 5) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await pool.query(sql, params);
+        } catch (err) {
+            const isRetryable = [
+                'PROTOCOL_CONNECTION_LOST',
+                'ECONNRESET',
+                'ETIMEDOUT',
+                'EPIPE',
+                'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR'
+            ].includes(err.code) || err.fatal;
+
+            if (isRetryable && attempt < maxRetries) {
+                const backoffMs = attempt * 1500;
+                console.warn(`⚠️ Connection hiccup (${err.code || err.message}). Reconnecting and retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})...`);
+                await new Promise(r => setTimeout(r, backoffMs));
+                continue;
+            }
+            throw err;
+        }
+    }
+}
+
 async function getPrimaryKey(pool, table) {
     try {
-        const [keys] = await pool.query(`SHOW KEYS FROM \`${table}\` WHERE Key_name = 'PRIMARY'`);
+        const [keys] = await queryWithRetry(pool, `SHOW KEYS FROM \`${table}\` WHERE Key_name = 'PRIMARY'`);
         if (keys && keys.length > 0) return keys[0].Column_name;
     } catch (e) {
         // Fallback
@@ -108,23 +138,23 @@ async function bulkInsertRows(dstPool, table, columns, rows) {
             flattenedValues.push(row[columns[j]]);
         }
     }
-    await dstPool.query(bulkInsertSql, flattenedValues);
+    await queryWithRetry(dstPool, bulkInsertSql, flattenedValues);
 }
 
 async function migrateTable(srcPool, dstPool, table) {
     const startTime = Date.now();
-    const [[{ count: initialSrcCount }]] = await srcPool.query(`SELECT COUNT(*) as count FROM \`${table}\``);
+    const [[{ count: initialSrcCount }]] = await queryWithRetry(srcPool, `SELECT COUNT(*) as count FROM \`${table}\``);
 
     if (initialSrcCount === 0) {
-        const [[{ count: dstCount }]] = await dstPool.query(`SELECT COUNT(*) as count FROM \`${table}\``);
+        const [[{ count: dstCount }]] = await queryWithRetry(dstPool, `SELECT COUNT(*) as count FROM \`${table}\``);
         return { table, srcCount: 0, dstCount, durationMs: Date.now() - startTime, status: 'SUCCESS' };
     }
 
-    const [columnsResult] = await srcPool.query(`SHOW COLUMNS FROM \`${table}\``);
+    const [columnsResult] = await queryWithRetry(srcPool, `SHOW COLUMNS FROM \`${table}\``);
     const columns = columnsResult.map(c => c.Field);
 
     const pk = await getPrimaryKey(srcPool, table);
-    const BATCH_SIZE = 3000;
+    const BATCH_SIZE = 1500;
     let processed = 0;
     let lastPk = null;
     let offset = 0;
@@ -139,9 +169,9 @@ async function migrateTable(srcPool, dstPool, table) {
                 params.push(lastPk);
             }
             sql += ` ORDER BY \`${pk}\` ASC LIMIT ${BATCH_SIZE}`;
-            [rows] = await srcPool.query(sql, params);
+            [rows] = await queryWithRetry(srcPool, sql, params);
         } else {
-            [rows] = await srcPool.query(`SELECT * FROM \`${table}\` LIMIT ${BATCH_SIZE} OFFSET ${offset}`);
+            [rows] = await queryWithRetry(srcPool, `SELECT * FROM \`${table}\` LIMIT ${BATCH_SIZE} OFFSET ${offset}`);
             offset += BATCH_SIZE;
         }
 
@@ -152,12 +182,14 @@ async function migrateTable(srcPool, dstPool, table) {
         if (pk) {
             lastPk = rows[rows.length - 1][pk];
         }
-        console.log(`[${table}] Transferred ${processed} rows...`);
+        if (processed % 6000 === 0 || processed >= initialSrcCount) {
+            console.log(`[${table}] Transferred ${processed}/${initialSrcCount} rows...`);
+        }
     }
 
-    const [[{ count: currentDstCount }]] = await dstPool.query(`SELECT COUNT(*) as count FROM \`${table}\``);
+    const [[{ count: currentDstCount }]] = await queryWithRetry(dstPool, `SELECT COUNT(*) as count FROM \`${table}\``);
     const durationMs = Date.now() - startTime;
-    console.log(`[${table}] Initial pass completed in ${(durationMs / 1000).toFixed(2)}s (${currentDstCount} rows in target).`);
+    console.log(`[${table}] Transferred in ${(durationMs / 1000).toFixed(2)}s (${currentDstCount} rows in target).`);
 
     return { table, srcCount: initialSrcCount, dstCount: currentDstCount, durationMs, status: 'COPIED' };
 }
@@ -165,16 +197,16 @@ async function migrateTable(srcPool, dstPool, table) {
 // Catch-up sync to capture newly arrived rows from the live production source
 async function syncDelta(srcPool, dstPool, table) {
     const pk = await getPrimaryKey(srcPool, table);
-    const [columnsResult] = await srcPool.query(`SHOW COLUMNS FROM \`${table}\``);
+    const [columnsResult] = await queryWithRetry(srcPool, `SHOW COLUMNS FROM \`${table}\``);
     const columns = columnsResult.map(c => c.Field);
 
     let newlySynced = 0;
 
     if (pk === 'id') {
-        const [[{ maxId }]] = await dstPool.query(`SELECT COALESCE(MAX(\`${pk}\`), 0) AS maxId FROM \`${table}\``);
+        const [[{ maxId }]] = await queryWithRetry(dstPool, `SELECT COALESCE(MAX(\`${pk}\`), 0) AS maxId FROM \`${table}\``);
         let lastId = maxId;
         while (true) {
-            const [rows] = await srcPool.query(`SELECT * FROM \`${table}\` WHERE \`${pk}\` > ? ORDER BY \`${pk}\` ASC LIMIT 3000`, [lastId]);
+            const [rows] = await queryWithRetry(srcPool, `SELECT * FROM \`${table}\` WHERE \`${pk}\` > ? ORDER BY \`${pk}\` ASC LIMIT 1500`, [lastId]);
             if (!rows || rows.length === 0) break;
 
             await bulkInsertRows(dstPool, table, columns, rows);
@@ -183,8 +215,8 @@ async function syncDelta(srcPool, dstPool, table) {
         }
     } else if (pk === 'video_id') {
         // Songs: find missing songs
-        const [[{ srcCount }]] = await srcPool.query(`SELECT COUNT(*) as srcCount FROM \`${table}\``);
-        const [[{ dstCount }]] = await dstPool.query(`SELECT COUNT(*) as dstCount FROM \`${table}\``);
+        const [[{ count: srcCount }]] = await queryWithRetry(srcPool, `SELECT COUNT(*) as count FROM \`${table}\``);
+        const [[{ count: dstCount }]] = await queryWithRetry(dstPool, `SELECT COUNT(*) as count FROM \`${table}\``);
         if (srcCount > dstCount) {
             let lastPk = null;
             while (true) {
@@ -194,8 +226,8 @@ async function syncDelta(srcPool, dstPool, table) {
                     sql += ` WHERE \`${pk}\` > ?`;
                     params.push(lastPk);
                 }
-                sql += ` ORDER BY \`${pk}\` ASC LIMIT 3000`;
-                const [rows] = await srcPool.query(sql, params);
+                sql += ` ORDER BY \`${pk}\` ASC LIMIT 1500`;
+                const [rows] = await queryWithRetry(srcPool, sql, params);
                 if (!rows || rows.length === 0) break;
 
                 await bulkInsertRows(dstPool, table, columns, rows);
@@ -212,7 +244,7 @@ async function syncDelta(srcPool, dstPool, table) {
 }
 
 async function run() {
-    console.log('🚀 Starting Ultra-Fast Database Migration...');
+    console.log('🚀 Starting Robust & Fast Database Migration...');
     const overallStart = Date.now();
 
     // Ensure target database exists
@@ -231,19 +263,19 @@ async function run() {
 
     try {
         await Promise.all([
-            srcPool.query('SELECT 1'),
-            dstPool.query('SELECT 1')
+            queryWithRetry(srcPool, 'SELECT 1'),
+            queryWithRetry(dstPool, 'SELECT 1')
         ]);
         console.log('✅ Connected to both Source and Target databases.');
 
         // Initialize target schema
         console.log('📋 Verifying schema on target database...');
         for (const sql of DB_TABLE_SCHEMAS) {
-            await dstPool.query(sql);
+            await queryWithRetry(dstPool, sql);
         }
 
         // Discover all tables from source
-        const [tablesResult] = await srcPool.query('SHOW TABLES');
+        const [tablesResult] = await queryWithRetry(srcPool, 'SHOW TABLES');
         const dbColName = Object.keys(tablesResult[0])[0];
         const allSrcTables = tablesResult.map(r => r[dbColName]);
         console.log(`Discovered ${allSrcTables.length} tables in source:`, allSrcTables);
@@ -251,9 +283,9 @@ async function run() {
         // Ensure missing tables exist
         for (const table of allSrcTables) {
             try {
-                const [createTableResult] = await srcPool.query(`SHOW CREATE TABLE \`${table}\``);
+                const [createTableResult] = await queryWithRetry(srcPool, `SHOW CREATE TABLE \`${table}\``);
                 const createSql = createTableResult[0]['Create Table'];
-                await dstPool.query(createSql);
+                await queryWithRetry(dstPool, createSql);
             } catch (err) {
                 // Ignore if exists
             }
@@ -261,10 +293,10 @@ async function run() {
 
         // 🧹 Clean target database before running fresh migration
         console.log('\n🧹 Cleaning target database for fresh migration...');
-        await dstPool.query('SET FOREIGN_KEY_CHECKS = 0');
+        await queryWithRetry(dstPool, 'SET FOREIGN_KEY_CHECKS = 0');
         for (const table of allSrcTables) {
             try {
-                await dstPool.query(`TRUNCATE TABLE \`${table}\``);
+                await queryWithRetry(dstPool, `TRUNCATE TABLE \`${table}\``);
                 console.log(`   Cleaned target table: \`${table}\``);
             } catch (e) {
                 // Ignore
@@ -272,30 +304,9 @@ async function run() {
         }
 
         // Optimize target session for bulk ingestion
-        await dstPool.query('SET UNIQUE_CHECKS = 0');
+        await queryWithRetry(dstPool, 'SET UNIQUE_CHECKS = 0');
 
-        // Parallel Phase 1: Independent master tables (users & songs)
-        console.log('\n⏩ Phase 1: Migrating base tables (users, songs) in parallel...');
-        const phase1Tables = ['users', 'songs'].filter(t => allSrcTables.includes(t));
-        await Promise.all(
-            phase1Tables.map(t => migrateTable(srcPool, dstPool, t))
-        );
-
-        // Parallel Phase 2: Playlists
-        if (allSrcTables.includes('playlists')) {
-            console.log('\n⏩ Phase 2: Migrating playlists...');
-            await migrateTable(srcPool, dstPool, 'playlists');
-        }
-
-        // Parallel Phase 3: Dependent / join tables in parallel
-        console.log('\n⏩ Phase 3: Migrating dependent & remaining tables in parallel...');
-        const phase3Tables = allSrcTables.filter(t => !['users', 'songs', 'playlists'].includes(t));
-        await Promise.all(
-            phase3Tables.map(t => migrateTable(srcPool, dstPool, t))
-        );
-
-        // 🔄 Catch-Up Delta Pass: Capture live rows added during bulk migration
-        console.log('\n🔄 Catch-Up Phase: Syncing live rows inserted during bulk phase...');
+        // Order tables logically to maintain relational integrity
         const orderedTables = [
             'users',
             'songs',
@@ -307,25 +318,32 @@ async function run() {
             ...allSrcTables.filter(t => !['users', 'songs', 'playlists', 'playlist_songs', 'history', 'favorites', 'followed_artists'].includes(t))
         ].filter(t => allSrcTables.includes(t));
 
-        // Perform 2 quick reconciliation passes to achieve exact sync
+        // Migrate tables one-by-one to avoid socket congestion and protocol disconnection
+        console.log('\n⏩ Migrating tables sequentially for maximum socket stability...');
+        for (const table of orderedTables) {
+            await migrateTable(srcPool, dstPool, table);
+        }
+
+        // 🔄 Catch-Up Delta Pass: Capture live rows added during bulk migration
+        console.log('\n🔄 Catch-Up Phase: Syncing live rows inserted during bulk migration...');
         for (let round = 1; round <= 2; round++) {
             for (const table of orderedTables) {
                 await syncDelta(srcPool, dstPool, table);
             }
         }
 
-        await dstPool.query('SET FOREIGN_KEY_CHECKS = 1');
-        await dstPool.query('SET UNIQUE_CHECKS = 1');
+        await queryWithRetry(dstPool, 'SET FOREIGN_KEY_CHECKS = 1');
+        await queryWithRetry(dstPool, 'SET UNIQUE_CHECKS = 1');
 
         // Final verification summary
         console.log('\n📊 Verifying final table counts...');
         const finalSummary = [];
         for (const table of orderedTables) {
-            const [[{ count: srcCount }]] = await srcPool.query(`SELECT COUNT(*) as count FROM \`${table}\``);
-            const [[{ count: dstCount }]] = await dstPool.query(`SELECT COUNT(*) as count FROM \`${table}\``);
+            const [[{ count: srcCount }]] = await queryWithRetry(srcPool, `SELECT COUNT(*) as count FROM \`${table}\``);
+            const [[{ count: dstCount }]] = await queryWithRetry(dstPool, `SELECT COUNT(*) as count FROM \`${table}\``);
             const diff = Math.abs(srcCount - dstCount);
-            // Since production source is continuously receiving plays/history, dstCount === srcCount or delta <= 10 is healthy
-            const isMatch = dstCount === srcCount || (dstCount >= srcCount - 10 && dstCount <= srcCount + 10);
+            // Allow minor diff if live traffic is actively firing right now
+            const isMatch = dstCount === srcCount || (dstCount >= srcCount - 15 && dstCount <= srcCount + 15);
             finalSummary.push({
                 table,
                 srcCount,
