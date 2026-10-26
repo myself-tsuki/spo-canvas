@@ -1,12 +1,16 @@
-name: Fast Database Migration
+name: PostgreSQL Database Migration
 
 on:
   workflow_dispatch:
     inputs:
-      target_db_name:
-        description: 'Target Database Name'
+      target_pg_url:
+        description: 'Target PostgreSQL Connection String'
         required: false
-        default: 'test'
+        default: 'postgresql://muzo:muzo123@160.22.109.140:5432/muzo'
+      source_db_user:
+        description: 'Source Database User'
+        required: false
+        default: 'NJiLRqKxh1QG3am.root'
       source_db_name:
         description: 'Source Database Name'
         required: false
@@ -14,9 +18,9 @@ on:
 
 jobs:
   migrate:
-    name: Execute High-Speed TiDB Migration
+    name: Execute MySQL to PostgreSQL Migration
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Repository
@@ -28,18 +32,14 @@ jobs:
           node-version: 20
 
       - name: Install Dependencies
-        run: npm install mysql2 dotenv
+        run: npm install mysql2 dotenv pg
 
       - name: Run Migration
         env:
           SOURCE_DB_HOST: ${{ secrets.SOURCE_DB_HOST || 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com' }}
           SOURCE_DB_PORT: ${{ secrets.SOURCE_DB_PORT || '4000' }}
-          SOURCE_DB_USER: ${{ secrets.SOURCE_DB_USER || '3jmws3vjSEBzHAs.root' }}
-          SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD || 'yB3MSU7tNyUAh84n' }}
+          SOURCE_DB_USER: ${{ github.event.inputs.source_db_user || secrets.SOURCE_DB_USER || 'NJiLRqKxh1QG3am.root' }}
+          SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD || 'H6YEFIEODY97QvHQ' }}
           SOURCE_DB_NAME: ${{ github.event.inputs.source_db_name || secrets.SOURCE_DB_NAME || 'test' }}
-          TARGET_DB_HOST: ${{ secrets.TARGET_DB_HOST || 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com' }}
-          TARGET_DB_PORT: ${{ secrets.TARGET_DB_PORT || '4000' }}
-          TARGET_DB_USER: ${{ secrets.TARGET_DB_USER || 'NJiLRqKxh1QG3am.root' }}
-          TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD || 'H6YEFIEODY97QvHQ' }}
-          TARGET_DB_NAME: ${{ github.event.inputs.target_db_name || secrets.TARGET_DB_NAME || 'test' }}
+          TARGET_PG_URL: ${{ github.event.inputs.target_pg_url || secrets.TARGET_PG_URL || 'postgresql://muzo:muzo123@160.22.109.140:5432/muzo' }}
         run: node migrate/migrate.js
